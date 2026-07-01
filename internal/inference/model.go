@@ -1,105 +1,114 @@
 package inference
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../include
+#cgo LDFLAGS: -L${SRCDIR}/../../bin -lllama -lggml
+#include <stdlib.h>
+#include <stdbool.h>
+#include "llama.h"
+*/
+import "C"
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
-	"runtime"
-	"syscall"
 	"unsafe"
-
-	"github.com/ebitengine/purego"
 )
 
 type ModelConfig struct {
 	ModelPath  string
 	NumThreads int
+	ContextCtx int
 }
 
-type LlamaEngine struct {
-	libHandle         uintptr
-	llamaBackendInit  func()
-	llamaBackendFree  func()
-	llamaInitFromFile func(path string, params uintptr) uintptr
-	llamaFree         func(model uintptr)
+type LlamaRuntime struct {
+	Model *C.struct_llama_model
+	Ctx   *C.struct_llama_context
 }
 
-var engine LlamaEngine
+func InitEngine() {
+	C.llama_backend_init()
 
-func InitEngine(libPath string) error {
-	var handle uintptr
+	cPath := C.CString("/mnt/d/Code/glim/bin")
+	defer C.free(unsafe.Pointer(cPath))
 
-	if runtime.GOOS == "windows" {
-		binDir := filepath.Dir(libPath)
-
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		setDllDir := kernel32.NewProc("SetDllDirectoryW")
-
-		if setDllDir.Find() == nil {
-			utf16Dir, err := syscall.UTF16PtrFromString(binDir)
-			if err == nil {
-				_, _, _ = setDllDir.Call(uintptr(unsafe.Pointer(utf16Dir)))
-			}
-		}
-
-		h, winErr := syscall.LoadLibrary(libPath)
-		if winErr != nil {
-			return fmt.Errorf("failed to load windows shared library (.dll): %w", winErr)
-		}
-		handle = uintptr(h)
-
-		if setDllDir.Find() == nil {
-			_, _, _ = setDllDir.Call(0)
-		}
-	} else {
-		return errors.New("platform loading configuration not compiled for this environment target")
-	}
-
-	engine.libHandle = handle
-
-	purego.RegisterLibFunc(&engine.llamaBackendInit, handle, "llama_backend_init")
-	purego.RegisterLibFunc(&engine.llamaBackendFree, handle, "llama_backend_free")
-	purego.RegisterLibFunc(&engine.llamaInitFromFile, handle, "llama_model_load_from_file")
-	purego.RegisterLibFunc(&engine.llamaFree, handle, "llama_model_free")
-
-	if engine.llamaBackendInit == nil || engine.llamaInitFromFile == nil {
-		return errors.New("required llama.cpp structural symbols missing from library binary")
-	}
-
-	engine.llamaBackendInit()
-	return nil
+	C.ggml_backend_load_all_from_path(cPath)
 }
 
-func Close(modelPtr uintptr) {
-	if modelPtr != 0 && engine.llamaFree != nil {
-		engine.llamaFree(modelPtr)
+func Close(rt LlamaRuntime) {
+	if rt.Ctx != nil {
+		C.llama_free(rt.Ctx)
 	}
-	if engine.llamaBackendFree != nil {
-		engine.llamaBackendFree()
+	if rt.Model != nil {
+		C.llama_model_free(rt.Model)
 	}
-	if engine.libHandle != 0 {
-		if runtime.GOOS == "windows" {
-			syscall.FreeLibrary(syscall.Handle(engine.libHandle))
-		}
-	}
+	C.llama_backend_free()
 }
 
-func LoadModel(config ModelConfig) (uintptr, error) {
-	if engine.llamaInitFromFile == nil {
-		return 0, errors.New("engine layer not initialized; call InitEngine first")
+func LoadModel(config ModelConfig) (LlamaRuntime, error) {
+	var rt LlamaRuntime
+
+	cPath := C.CString(config.ModelPath)
+	defer C.free(unsafe.Pointer(cPath))
+
+	mParams := C.llama_model_default_params()
+
+	rt.Model = C.llama_model_load_from_file(cPath, mParams)
+	if rt.Model == nil {
+		return rt, fmt.Errorf("failed to load model from path: %s", config.ModelPath)
 	}
 
-	modelPtr := engine.llamaInitFromFile(config.ModelPath, 0)
-	if modelPtr == 0 {
-		return 0, fmt.Errorf("failed to load model from path: %s", config.ModelPath)
+	cParams := C.llama_context_default_params()
+	cParams.n_ctx = C.uint32_t(config.ContextCtx)
+	cParams.n_threads = C.int32_t(config.NumThreads)
+
+	rt.Ctx = C.llama_init_from_model(rt.Model, cParams)
+	if rt.Ctx == nil {
+		C.llama_model_free(rt.Model)
+		return rt, errors.New("failed to allocate dynamic context matrix via CGO layer")
 	}
 
-	return modelPtr, nil
+	return rt, nil
 }
 
-func GetDefaultLibPath() string {
-	if runtime.GOOS == "windows" {
-		return "bin/llama.dll"
+func Tokenize(model *C.struct_llama_model, input string, addSpecial bool) ([]int32, error) {
+	if model == nil {
+		return nil, errors.New("provided model reference pointer is nil")
 	}
-	return "./libllama.so"
+
+	vocab := C.llama_model_get_vocab(model)
+	if vocab == nil {
+		return nil, errors.New("failed to retrieve vocabulary pointer matrix from model")
+	}
+
+	cInput := C.CString(input)
+	defer C.free(unsafe.Pointer(cInput))
+
+	maxTokens := C.int(len(input) + 4)
+	tokenBuffer := make([]C.llama_token, maxTokens)
+
+	var addSpec C.bool = false
+	if addSpecial {
+		addSpec = true
+	}
+
+	nTokens := C.llama_tokenize(
+		vocab,
+		cInput,
+		C.int(len(input)),
+		&tokenBuffer[0],
+		maxTokens,
+		addSpec,
+		true,
+	)
+
+	if nTokens < 0 {
+		return nil, errors.New("internal tokenizer processing anomaly")
+	}
+
+	goTokens := make([]int32, nTokens)
+	for i := 0; i < int(nTokens); i++ {
+		goTokens[i] = int32(tokenBuffer[i])
+	}
+
+	return goTokens, nil
 }

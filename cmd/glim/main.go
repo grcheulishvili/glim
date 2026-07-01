@@ -11,20 +11,36 @@ import (
 func main() {
 	wd, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "<<>> Error getting working directory: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	libPath := filepath.Join(wd, "bin", "llama.dll")
+	modelPath := filepath.Join(wd, "models", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
 
-	fmt.Printf("<<>> Loading engine runtime matrix from: %s\n", libPath)
+	inference.InitEngine()
 
-	err = inference.InitEngine(libPath)
+	config := inference.ModelConfig{
+		ModelPath:  modelPath,
+		NumThreads: 4,
+		ContextCtx: 2048,
+	}
+
+	fmt.Printf("[*] Compiling memory context allocations for: %s\n", modelPath)
+	runtime, err := inference.LoadModel(config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "<<>> Engine bootstrap failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] CGO Allocation crash: %v\n", err)
 		os.Exit(1)
 	}
-	defer inference.Close(0)
+	defer inference.Close(runtime)
 
-	fmt.Println("<<>> Local inference core linked successfully. Ready to bind model tensors.")
+	fmt.Println("[+] CGO context matrix stable. Testing tokenizer layer...")
+
+	testString := "System anomaly detected: unexpected port 443 execution."
+	tokens, err := inference.Tokenize(runtime.Model, testString, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Token processing failure: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[+] Tokenization Success: %v\n", tokens)
 }

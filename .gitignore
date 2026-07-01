@@ -35,3 +35,8 @@ go.work.sum
 idea.md
 roadmap.md
 bin/
+build/
+glim
+bin/*.so
+bin/*.so.*
+models/*.gguf
