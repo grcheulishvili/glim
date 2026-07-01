@@ -31,4 +31,7 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# custom
 idea.md
+roadmap.md
+bin/
