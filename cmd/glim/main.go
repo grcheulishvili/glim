@@ -2,45 +2,46 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
-	"path/filepath"
 
 	"glim/internal/inference"
 )
 
 func main() {
-	wd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	modelPath := filepath.Join(wd, "models", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
-
+	fmt.Println("[*] Stabilizing core engine interfaces...")
 	inference.InitEngine()
 
 	config := inference.ModelConfig{
-		ModelPath:  modelPath,
-		NumThreads: 4,
+		ModelPath:  "/mnt/d/Code/glim/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
 		ContextCtx: 2048,
+		NumThreads: 4,
 	}
 
-	fmt.Printf("[*] Compiling memory context allocations for: %s\n", modelPath)
+	fmt.Printf("[*] Compiling memory context allocations for: %s\n", config.ModelPath)
 	runtime, err := inference.LoadModel(config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] CGO Allocation crash: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("[!] CGO Allocation crash: %v\n", err)
 	}
-	defer inference.Close(runtime)
+	defer runtime.Free()
 
-	fmt.Println("[+] CGO context matrix stable. Testing tokenizer layer...")
-
-	testString := "System anomaly detected: unexpected port 443 execution."
-	tokens, err := inference.Tokenize(runtime.Model, testString, true)
+	// Verify target pipeline execution string
+	prompt := "<|im_start|>user\nWrite a short shell script to check open ports.<|im_end|>\n<|im_start|>assistant\n"
+	tokens, err := inference.Tokenize(runtime.Model, prompt, true)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] Token processing failure: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("[!] Tokenizer step failure: %v\n", err)
 	}
 
-	fmt.Printf("[+] Tokenization Success: %v\n", tokens)
+	fmt.Printf("[+] Processing Tokenization Array: %v\n", tokens)
+	fmt.Println("\n--- Assistant Generation Stream ---")
+
+	err = inference.DecodeStream(runtime, tokens, 128, func(token string) {
+		fmt.Print(token)
+		os.Stdout.Sync() // Flush standard out matrix continuously for real-time text visualization
+	})
+	if err != nil {
+		log.Fatalf("\n[!] Loop evaluation crash: %v\n", err)
+	}
+
+	fmt.Println("\n\n--- Generation Cycle Cleanly Complete ---")
 }
