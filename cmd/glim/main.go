@@ -18,30 +18,57 @@ func main() {
 		NumThreads: 4,
 	}
 
-	fmt.Printf("[*] Compiling memory context allocations for: %s\n", config.ModelPath)
+	sampler := inference.SamplerConfig{
+		Temperature: 0.7,
+		TopK:        40,
+		TopP:        0.95,
+		Seed:        0, // 0 triggers automated cryptographic entropy sourcing
+	}
+
 	runtime, err := inference.LoadModel(config)
 	if err != nil {
 		log.Fatalf("[!] CGO Allocation crash: %v\n", err)
 	}
 	defer runtime.Free()
 
-	// Verify target pipeline execution string
-	prompt := "<|im_start|>user\nWrite a short shell script to check open ports.<|im_end|>\n<|im_start|>assistant\n"
-	tokens, err := inference.Tokenize(runtime.Model, prompt, true)
-	if err != nil {
-		log.Fatalf("[!] Tokenizer step failure: %v\n", err)
+	// Initialize persistent state tracking across consecutive generation boundaries
+	session := inference.NewSession(&runtime, 0)
+
+	// --- Turn 1 ---
+	history := []inference.Message{
+		{Role: "system", Content: "You are a concise offensive security architecture expert."},
+		{Role: "user", Content: "Name the primary API call monitored for standard LSASS parsing."},
 	}
 
-	fmt.Printf("[+] Processing Tokenization Array: %v\n", tokens)
-	fmt.Println("\n--- Assistant Generation Stream ---")
+	prompt1, _ := inference.FormatMessages(inference.TemplateChatML, history)
+	tokens1, _ := inference.Tokenize(runtime.Model, prompt1, true)
 
-	err = inference.DecodeStream(runtime, tokens, 128, func(token string) {
+	fmt.Println("\n[Turn 1] Assistant:")
+	err = session.ExecuteTurn(sampler, tokens1, 64, func(token string) {
 		fmt.Print(token)
-		os.Stdout.Sync() // Flush standard out matrix continuously for real-time text visualization
+		os.Stdout.Sync()
 	})
 	if err != nil {
-		log.Fatalf("\n[!] Loop evaluation crash: %v\n", err)
+		log.Fatalf("\n[!] Turn 1 execution crash: %v\n", err)
+	}
+	fmt.Println()
+
+	// --- Turn 2 (Incremental context execution - NO full cache clear) ---
+	followUp := []inference.Message{
+		{Role: "user", Content: "Give me an alternate user-mode alternative that bypasses it."},
 	}
 
-	fmt.Println("\n\n--- Generation Cycle Cleanly Complete ---")
+	// We only tokenize the delta because the sequence state is retained in the KV matrix
+	prompt2, _ := inference.FormatMessages(inference.TemplateChatML, followUp)
+	tokens2, _ := inference.Tokenize(runtime.Model, prompt2, false) // False: do not append standalone BOS token markers
+
+	fmt.Println("\n[Turn 2] Assistant:")
+	err = session.ExecuteTurn(sampler, tokens2, 128, func(token string) {
+		fmt.Print(token)
+		os.Stdout.Sync()
+	})
+	if err != nil {
+		log.Fatalf("\n[!] Turn 2 execution crash: %v\n", err)
+	}
+	fmt.Println("\n\n--- Session Execution Phase Cleanly Complete ---")
 }
