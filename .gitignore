@@ -34,8 +34,7 @@ go.work.sum
 # custom
 idea.md
 roadmap.md
-bin/
-build/
+build/*.gguf
 glim
 bin/*.so
 bin/*.so.*

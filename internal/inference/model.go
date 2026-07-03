@@ -2,10 +2,25 @@ package inference
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../include
-#cgo LDFLAGS: -L${SRCDIR}/../../bin -lllama -lggml
+#cgo LDFLAGS: -L${SRCDIR}/../../bin -Wl,-Bstatic -lllama -lggml -lggml-cpu -lggml-base -Wl,-Bdynamic -lm -lstdc++ -lgomp -lpthread -ldl
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include "llama.h"
+
+static bool glim_verbose_enabled = false;
+
+static void glim_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    if (glim_verbose_enabled) {
+        fprintf(stderr, "%s", text);
+        fflush(stderr);
+    }
+}
+
+static void glim_setup_logging(bool verbose) {
+    glim_verbose_enabled = verbose;
+    llama_log_set(glim_log_callback, NULL);
+}
 
 static void glim_batch_set_token(struct llama_batch *batch, int32_t i, llama_token token, llama_pos pos, llama_seq_id seq_id, bool logits) {
     batch->token[i]    = token;
@@ -46,6 +61,7 @@ type SamplerConfig struct {
 	TopK        int32
 	TopP        float32
 	Seed        uint32
+	GrammarStr  string
 }
 
 type ModelConfig struct {
@@ -66,9 +82,11 @@ type ContextSession struct {
 	CurrentPos int32
 }
 
-func InitEngine() {
+func InitEngine(verbose bool) {
 	cPath := C.CString("/mnt/d/Code/glim/bin")
 	defer C.free(unsafe.Pointer(cPath))
+
+	C.glim_setup_logging(C.bool(verbose))
 	C.llama_backend_init()
 	C.ggml_backend_load_all_from_path(cPath)
 }
@@ -105,8 +123,8 @@ func LoadModel(config ModelConfig) (LlamaRuntime, error) {
 }
 
 func NewSession(rt *LlamaRuntime, seqID int32) *ContextSession {
-	// Flush allocation slices matching this specific sequence partition before mounting
-	C.llama_memory_seq_rm(C.llama_get_memory(rt.Ctx), C.llama_seq_id(seqID), -1, -1)
+	// Fixed: Reverted to the native llama_memory_seq_rm API using the context memory pointer
+	C.llama_memory_seq_rm(C.llama_get_memory(rt.Ctx), C.llama_seq_id(seqID), 0, -1)
 	return &ContextSession{
 		Runtime:    rt,
 		SequenceID: seqID,
@@ -114,24 +132,18 @@ func NewSession(rt *LlamaRuntime, seqID int32) *ContextSession {
 	}
 }
 
-func GetMetadataString(model *C.struct_llama_model, key string) (string, error) {
-	if model == nil {
-		return "", errors.New("model reference pointer is nil")
+func (cs *ContextSession) Reset() {
+	if cs.Runtime.Ctx == nil {
+		return
 	}
-
-	cKey := C.CString(key)
-	defer C.free(unsafe.Pointer(cKey))
-
-	bufSize := C.size_t(4096)
-	buf := C.malloc(bufSize)
-	defer C.free(buf)
-
-	res := C.llama_model_meta_val_str(model, cKey, (*C.char)(buf), bufSize)
-	if res < 0 {
-		return "", fmt.Errorf("metadata key not found or buffer bounds exceeded: %s", key)
-	}
-
-	return C.GoString((*C.char)(buf)), nil
+	// Fixed: Reverted to the native llama_memory_seq_rm API using the context memory pointer
+	C.llama_memory_seq_rm(
+		C.llama_get_memory(cs.Runtime.Ctx),
+		C.llama_seq_id(cs.SequenceID),
+		0,
+		-1,
+	)
+	cs.CurrentPos = 0
 }
 
 func FormatMessages(template ChatTemplate, messages []Message) (string, error) {
@@ -194,7 +206,6 @@ func (lr *LlamaRuntime) Free() {
 	}
 }
 
-// ExecuteTurn appends a new token sequence into the session KV context slice
 func (cs *ContextSession) ExecuteTurn(smpl SamplerConfig, newTokens []int32, maxOutputTokens int, onToken func(string)) error {
 	if len(newTokens) == 0 {
 		return errors.New("empty processing token slice passed to generation layer")
@@ -225,6 +236,18 @@ func (cs *ContextSession) ExecuteTurn(smpl SamplerConfig, newTokens []int32, max
 	chain := C.llama_sampler_chain_init(sparams)
 	defer C.llama_sampler_free(chain)
 
+	if smpl.GrammarStr != "" {
+		cGrammar := C.CString(smpl.GrammarStr)
+		cRoot := C.CString("root")
+		defer C.free(unsafe.Pointer(cGrammar))
+		defer C.free(unsafe.Pointer(cRoot))
+
+		grammarSampler := C.llama_sampler_init_grammar(cs.Runtime.Vocab, cGrammar, cRoot)
+		if grammarSampler != nil {
+			C.llama_sampler_chain_add(chain, grammarSampler)
+		}
+	}
+
 	if smpl.TopK > 0 {
 		C.llama_sampler_chain_add(chain, C.llama_sampler_init_top_k(C.int32_t(smpl.TopK)))
 	}
@@ -247,7 +270,7 @@ func (cs *ContextSession) ExecuteTurn(smpl SamplerConfig, newTokens []int32, max
 	if C.llama_decode(cs.Runtime.Ctx, batch) != 0 {
 		return errors.New("failed to execute incremental matrix sequence evaluation step")
 	}
-	cs.CurrentPos += batch.n_tokens
+	cs.CurrentPos += int32(batch.n_tokens)
 
 	tokenBuf := make([]byte, 256)
 	lastToken := C.llama_sampler_sample(chain, cs.Runtime.Ctx, batch.n_tokens-1)

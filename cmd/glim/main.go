@@ -4,71 +4,138 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
+	"time"
 
+	"glim/internal/engine"
 	"glim/internal/inference"
+	"glim/internal/mask"
+
+	"github.com/spf13/pflag"
 )
 
-func main() {
-	fmt.Println("[*] Stabilizing core engine interfaces...")
-	inference.InitEngine()
-
-	config := inference.ModelConfig{
-		ModelPath:  "/mnt/d/Code/glim/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
-		ContextCtx: 2048,
-		NumThreads: 4,
+func parseSchemaFlag(schemaRaw string) map[string]string {
+	schema := make(map[string]string)
+	if schemaRaw == "" {
+		return schema
 	}
 
-	sampler := inference.SamplerConfig{
-		Temperature: 0.7,
+	pairs := strings.Split(schemaRaw, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, ":", 2)
+		if len(kv) == 2 {
+			schema[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		} else if len(kv) == 1 {
+			schema[strings.TrimSpace(kv[0])] = "string"
+		}
+	}
+	return schema
+}
+
+func main() {
+	var (
+		modelPath   string
+		ctxLength   int
+		numThreads  int
+		schemaRaw   string
+		temperature float32
+		maxTokens   int
+		verbose     bool
+	)
+
+	homeDir, _ := os.UserHomeDir()
+	defaultModelPath := fmt.Sprintf("%s/.local/share/glim/models/qwen2.5-1.5b-instruct-q4_k_m.gguf", homeDir)
+
+	pflag.StringVarP(&modelPath, "model", "m", defaultModelPath, "Path to GGUF target model binary")
+	pflag.IntVarP(&ctxLength, "ctx-size", "c", 2048, "KV matrix context token allocation limit")
+	pflag.IntVarP(&numThreads, "threads", "t", 4, "Physical CPU execution threads allocated for compute")
+	pflag.StringVarP(&schemaRaw, "json", "j", "ip:string,vector:string", "Comma separated target schema mapping (key:type)")
+	pflag.IntVarP(&maxTokens, "max-tokens", "n", 128, "Max token window size bound per pipeline evaluation sequence")
+	pflag.Float32Var(&temperature, "temp", 0.0, "Sampling temperature modifier")
+	pflag.BoolVarP(&verbose, "verbose", "v", false, "Enable verbose internal diagnostic logging from llama.cpp")
+	pflag.Parse()
+
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		log.Fatalf("[!] Engine Matrix file missing at target path layout.\nTarget: %s\n", modelPath)
+	}
+
+	inference.InitEngine(verbose)
+
+	modelConfig := inference.ModelConfig{
+		ModelPath:  modelPath,
+		ContextCtx: ctxLength,
+		NumThreads: numThreads,
+	}
+
+	targetSchema := parseSchemaFlag(schemaRaw)
+	var gbnfRules string
+	if len(targetSchema) > 0 {
+		gbnfRules = mask.GenerateJSONSchemaGBNF(targetSchema)
+	}
+
+	samplerConfig := inference.SamplerConfig{
+		Temperature: temperature,
 		TopK:        40,
 		TopP:        0.95,
-		Seed:        0, // 0 triggers automated cryptographic entropy sourcing
+		Seed:        0,
+		GrammarStr:  gbnfRules,
 	}
 
-	runtime, err := inference.LoadModel(config)
+	streamConfig := engine.StreamConfig{
+		FlushTimeout: 50 * time.Millisecond,
+		MaxLines:     1,
+		MaxBytes:     1024,
+	}
+
+	runtime, err := inference.LoadModel(modelConfig)
 	if err != nil {
-		log.Fatalf("[!] CGO Allocation crash: %v\n", err)
+		log.Fatalf("[!] Runtime initialization failure: %v\n", err)
 	}
 	defer runtime.Free()
 
-	// Initialize persistent state tracking across consecutive generation boundaries
 	session := inference.NewSession(&runtime, 0)
 
-	// --- Turn 1 ---
-	history := []inference.Message{
-		{Role: "system", Content: "You are a concise offensive security architecture expert."},
-		{Role: "user", Content: "Name the primary API call monitored for standard LSASS parsing."},
+	// Fixed: Structured context framing with positive and negative extraction anchors
+	systemRules := []inference.Message{
+		{
+			Role:    "system",
+			Content: "You are a precise security log parser. Extract the network source IP address into the 'ip' field, and the core event message or classification into the 'vector' field. If a field does not exist in the log line, output an empty string \"\" immediately.\n\nExample 1:\nInput: sshd[999]: Accepted publickey for root from 10.0.0.15 port 22 ssh2\nOutput: {\n  \"ip\": \"10.0.0.15\",\n  \"vector\": \"Accepted publickey for root\"\n}\n\nExample 2:\nInput: Cron jobs completed successfully\nOutput: {\n  \"ip\": \"\",\n  \"vector\": \"Cron jobs completed successfully\"\n}",
+		},
 	}
+	basePrompt, _ := inference.FormatMessages(inference.TemplateChatML, systemRules)
 
-	prompt1, _ := inference.FormatMessages(inference.TemplateChatML, history)
-	tokens1, _ := inference.Tokenize(runtime.Model, prompt1, true)
+	chunks := make(chan string, 64)
+	go engine.ReadStream(os.Stdin, streamConfig, chunks)
 
-	fmt.Println("\n[Turn 1] Assistant:")
-	err = session.ExecuteTurn(sampler, tokens1, 64, func(token string) {
-		fmt.Print(token)
+	for chunk := range chunks {
+		session.Reset()
+
+		turnMessages := []inference.Message{
+			{
+				Role:    "user",
+				Content: fmt.Sprintf("Input: %s\nOutput: ", chunk),
+			},
+		}
+
+		formattedTurn, _ := inference.FormatMessages(inference.TemplateChatML, turnMessages)
+
+		// Unify context tracking matching the exact pattern of the examples
+		fullPrompt := basePrompt + formattedTurn + "{\n"
+		fullTokens, err := inference.Tokenize(runtime.Model, fullPrompt, true)
+		if err != nil {
+			log.Fatalf("[!] Tokenization error: %v\n", err)
+		}
+
+		fmt.Print("{\n")
 		os.Stdout.Sync()
-	})
-	if err != nil {
-		log.Fatalf("\n[!] Turn 1 execution crash: %v\n", err)
-	}
-	fmt.Println()
 
-	// --- Turn 2 (Incremental context execution - NO full cache clear) ---
-	followUp := []inference.Message{
-		{Role: "user", Content: "Give me an alternate user-mode alternative that bypasses it."},
+		err = session.ExecuteTurn(samplerConfig, fullTokens, maxTokens, func(token string) {
+			fmt.Print(token)
+			os.Stdout.Sync()
+		})
+		if err != nil {
+			log.Fatalf("\n[!] Stream turn evaluation failure: %v\n", err)
+		}
+		fmt.Println()
 	}
-
-	// We only tokenize the delta because the sequence state is retained in the KV matrix
-	prompt2, _ := inference.FormatMessages(inference.TemplateChatML, followUp)
-	tokens2, _ := inference.Tokenize(runtime.Model, prompt2, false) // False: do not append standalone BOS token markers
-
-	fmt.Println("\n[Turn 2] Assistant:")
-	err = session.ExecuteTurn(sampler, tokens2, 128, func(token string) {
-		fmt.Print(token)
-		os.Stdout.Sync()
-	})
-	if err != nil {
-		log.Fatalf("\n[!] Turn 2 execution crash: %v\n", err)
-	}
-	fmt.Println("\n\n--- Session Execution Phase Cleanly Complete ---")
 }
